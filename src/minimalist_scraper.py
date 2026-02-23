@@ -45,10 +45,35 @@ class MinimalistScraper:
         for tag in tags:
             tag_stripped = tag.strip()
             if tag_stripped.lower() not in self.noise_tags:
-                # Also skip tags that are purely numeric or very short
                 if len(tag_stripped) > 2 and not tag_stripped.replace(":", "").replace(".", "").isdigit():
                     cleaned.append(tag_stripped)
         return ", ".join(cleaned)
+
+    def extract_description(self, soup) -> str:
+        """
+        Extracts product description from the page HTML.
+        Targets span.metafield-multi_line_text_field inside span.product__subtitle
+        which is where Minimalist stores their product blurb (confirmed via inspector).
+        Grabs only the FIRST match to avoid pulling ingredient text.
+        """
+        # Target the product subtitle container first for specificity
+        subtitle_spans = soup.find_all('span', class_='product__subtitle')
+        for span in subtitle_spans:
+            desc_span = span.find('span', class_='metafield-multi_line_text_field')
+            if desc_span:
+                text = desc_span.get_text(separator=' ', strip=True)
+                text = re.sub(r'\s+', ' ', text).strip()
+                if text:
+                    return text
+
+        # Fallback: first metafield-multi_line_text_field on page
+        # (less specific but better than nothing)
+        fallback = soup.find('span', class_='metafield-multi_line_text_field')
+        if fallback:
+            text = fallback.get_text(separator=' ', strip=True)
+            return re.sub(r'\s+', ' ', text).strip()
+
+        return ""
 
     def extract_ingredients(self, soup) -> str:
         """
@@ -58,7 +83,6 @@ class MinimalistScraper:
         ingredients_list = []
         tabs = soup.find_all('toggle-tab', class_=lambda c: c and 'toggle--faq' in c)
 
-        # FAQ section headers we want to stop at
         stop_keywords = [
             "what are product specifications",
             "how does",
@@ -76,7 +100,7 @@ class MinimalistScraper:
             title_span = tab.find('span', class_='text-weight--bold')
             title = title_span.get_text(strip=True) if title_span else ""
 
-            # Stop if we've hit FAQ territory
+            # Stop when we hit FAQ territory
             if any(kw in title.lower() for kw in stop_keywords):
                 break
 
@@ -86,8 +110,7 @@ class MinimalistScraper:
                 desc_span = content_div.find('span', class_='metafield-multi_line_text_field')
                 desc = desc_span.get_text(strip=True) if desc_span else content_div.get_text(strip=True)
 
-            # Clean up the "All Ingredients" raw list — keep it but truncate
-            # at product specifications if it sneaks through
+            # Safety net — truncate if specs section sneaks through
             if "what are product specifications" in desc.lower():
                 desc = desc[:desc.lower().find("what are product specifications")].strip()
 
@@ -96,19 +119,41 @@ class MinimalistScraper:
 
         return " | ".join(ingredients_list)
 
-    def extract_description(self, json_data: dict) -> str:
+    def extract_rating(self, soup) -> tuple:
         """
-        Extracts clean product description from Shopify body_html field.
-        Strips all HTML tags.
+        Extracts Yotpo product ID from static HTML, then calls
+        Yotpo's public API to get rating and review count.
+        Returns (rating, review_count) or (None, None) if unavailable.
         """
-        body_html = json_data.get("body_html", "")
-        if not body_html:
-            return ""
-        soup = BeautifulSoup(body_html, "html.parser")
-        text = soup.get_text(separator=" ", strip=True)
-        # Collapse multiple spaces
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text
+        try:
+            yotpo_div = soup.find(attrs={"data-yotpo-product-id": True})
+            if not yotpo_div:
+                return None, None
+
+            yotpo_product_id = yotpo_div["data-yotpo-product-id"]
+
+            yotpo_url = (
+                f"https://staticw2.yotpo.com/batch/apps/"
+                f"Z0GGWM6QFIM4z2FNJbPwCOeXGKjUdkAhT2CCNVTY/domain_bottom_line"
+                f"?methods=%5B%7B%22method%22%3A%22products%22%2C%22params%22"
+                f"%3A%7B%22pid%22%3A%22{yotpo_product_id}%22%7D%7D%5D"
+            )
+            response = requests.get(yotpo_url, headers=self.headers, timeout=5)
+
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get("results", [])
+                if results:
+                    widget_data = results[0].get("widget", {})
+                    bottomline = widget_data.get("bottomline", {})
+                    rating = bottomline.get("average_score")
+                    review_count = bottomline.get("total_reviews")
+                    return rating, review_count
+
+        except Exception as e:
+            print(f"    ⚠️  Rating fetch failed: {e}")
+
+        return None, None
 
     def get_all_product_urls(self, limit=250):
         """
@@ -124,7 +169,6 @@ class MinimalistScraper:
                 result = []
                 for item in products:
                     tags = item.get("tags", [])
-                    # Pre-filter hidden products before even visiting their pages
                     if not self.should_skip_product(tags):
                         url = f"{self.base_url}/products/{item['handle']}"
                         result.append((url, tags))
@@ -144,14 +188,14 @@ class MinimalistScraper:
         """
         print(f"  Scraping: {product_url.split('/products/')[-1]}")
         try:
-            # 1. Shopify .js endpoint for structured data
+            # 1. Shopify .js endpoint for structured data (price, title, image)
             js_response = requests.get(f"{product_url}.js", headers=self.headers)
             if js_response.status_code != 200:
                 print(f"  ⚠️  Could not fetch .js for {product_url}")
                 return None
             json_data = js_response.json()
 
-            # 2. Full HTML page for ingredients (metafields not in .js)
+            # 2. Full HTML page for description, ingredients, and rating ID
             html_response = requests.get(product_url, headers=self.headers)
             soup = BeautifulSoup(html_response.text, 'html.parser')
 
@@ -161,41 +205,38 @@ class MinimalistScraper:
 
             # 4. Image URL
             featured_image = json_data.get("featured_image", "")
-            image_url = f"https:{featured_image}" if featured_image and not featured_image.startswith("http") else featured_image
+            image_url = (
+                f"https:{featured_image}"
+                if featured_image and not featured_image.startswith("http")
+                else featured_image
+            )
 
-            # 5. Clean concerns from tags (use catalog_tags which are more complete)
+            # 5. Description from HTML metafield (body_html is empty for Minimalist)
+            description = self.extract_description(soup)
+
+            # 6. Clean concerns from tags
             concerns = self.clean_tags_to_concerns(catalog_tags)
-
-            # 6. Description from body_html
-            description = self.extract_description(json_data)
 
             # 7. Ingredients from toggle tabs
             ingredients = self.extract_ingredients(soup)
+
+            # 8. Rating from Yotpo API (non-blocking — None if unavailable)
+            rating, review_count = self.extract_rating(soup)
 
             product_data = {
                 "brand": "Minimalist",
                 "product_name": json_data.get("title", "").strip(),
                 "description": description,
                 "price": formatted_price,
+                "rating": rating,
+                "review_count": review_count,
                 "product_url": product_url,
                 "image_url": image_url,
                 "category": json_data.get("type", "").strip(),
                 "target_concerns": concerns,
                 "ingredients": ingredients,
                 "tags": ", ".join(catalog_tags),
-
-                # Embedding text — pre-built concatenated field ready for embedder.py
-                "embed_text": ""
             }
-
-            # Build embed_text now so embedder.py just reads it directly
-            product_data["embed_text"] = (
-                f"Product: {product_data['product_name']}. "
-                f"Description: {product_data['description']}. "
-                f"Key Ingredients: {product_data['ingredients'][:800]}. "
-                f"Good for: {product_data['target_concerns']}. "
-                f"Category: {product_data['category']}."
-            ).strip()
 
             return product_data
 
@@ -218,7 +259,7 @@ if __name__ == "__main__":
     existing_urls = {item["product_url"] for item in existing_data}
     print(f"\n📁 Already scraped: {len(existing_urls)} products")
 
-    # 2. Fetch visible product URLs with their tags (hidden ones already filtered)
+    # 2. Fetch visible product URLs with tags (hidden ones pre-filtered)
     all_products = scraper.get_all_product_urls(limit=250)
 
     # 3. Delta filter — only scrape what's new
