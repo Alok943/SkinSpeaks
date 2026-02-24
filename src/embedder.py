@@ -112,10 +112,24 @@ def get_qdrant_client() -> QdrantClient:
     return client
 
 
+def _ensure_indexes(client: QdrantClient):
+    """
+    Creates payload indexes on all filterable fields.
+    create_payload_index is idempotent — safe to call even if the
+    index already exists. Only indexes fields that are actually in
+    the payload AND used in search filters.
+    """
+    client.create_payload_index(COLLECTION_NAME, "brand", PayloadSchemaType.KEYWORD)
+    client.create_payload_index(COLLECTION_NAME, "category", PayloadSchemaType.KEYWORD)
+    client.create_payload_index(COLLECTION_NAME, "price", PayloadSchemaType.FLOAT)
+    print(f"✅ Indexes ensured on: brand, category, price")
+
+
 def setup_collection(client: QdrantClient, recreate: bool = False):
     """
     Creates the Qdrant collection if it doesn't exist.
     Set recreate=True to wipe and rebuild from scratch.
+    Indexes are always ensured regardless of path taken.
     """
     existing = [c.name for c in client.get_collections().collections]
 
@@ -124,7 +138,10 @@ def setup_collection(client: QdrantClient, recreate: bool = False):
             print(f"🗑️  Deleting existing collection: {COLLECTION_NAME}")
             client.delete_collection(COLLECTION_NAME)
         else:
-            print(f"✅ Collection '{COLLECTION_NAME}' already exists. Skipping creation.")
+            print(f"✅ Collection '{COLLECTION_NAME}' already exists.")
+            # Always ensure indexes — covers the case where the collection
+            # existed before indexes were added to this script.
+            _ensure_indexes(client)
             return
 
     print(f"📦 Creating collection: {COLLECTION_NAME}")
@@ -135,13 +152,7 @@ def setup_collection(client: QdrantClient, recreate: bool = False):
             distance=Distance.COSINE,  # Cosine similarity for semantic search
         ),
     )
-
-    # Create payload indexes for fast filtered search later
-    # e.g. filter by brand="Minimalist" + semantic query
-    client.create_payload_index(COLLECTION_NAME, "brand", PayloadSchemaType.KEYWORD)
-    client.create_payload_index(COLLECTION_NAME, "category", PayloadSchemaType.KEYWORD)
-    client.create_payload_index(COLLECTION_NAME, "price", PayloadSchemaType.FLOAT)
-    print(f"✅ Collection created with indexes on: brand, category, price")
+    _ensure_indexes(client)
 
 
 # ──────────────────────────────────────────────

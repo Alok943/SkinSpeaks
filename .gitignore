@@ -10,3 +10,5 @@ data/*
 # Python cache
 __pycache__/
 *.pyc
+
+data/*.csv  # Only if the dataset is massive; use DVC or LFS otherwise
